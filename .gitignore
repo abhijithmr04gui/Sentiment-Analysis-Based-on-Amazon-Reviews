@@ -1,0 +1,13 @@
+.pydeps/
+__pycache__/
+*.pyc
+
+# Large/local artifacts
+*.pkl
+*.csv
+*.tsv
+
+# Local environment/editor
+.DS_Store
+.venv/
+venv/
