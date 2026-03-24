@@ -5,18 +5,46 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import matplotlib.pyplot as plt
+
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
+from sklearn.svm import LinearSVC
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import GridSearchCV, train_test_split
 
 
+# =========================
+# TEXT CLEANING + NEGATION HANDLING
+# =========================
 def clean_text(text):
     text = str(text).lower()
+
+    # remove urls
     text = re.sub(r"http\S+|www\.\S+", " ", text)
+
+    # keep only valid chars
     text = re.sub(r"[^a-z0-9\s']", " ", text)
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
+
+    words = text.split()
+
+    # 🔥 NEGATION HANDLING
+    negation_words = {"not", "no", "never", "n't"}
+    new_words = []
+    negate = False
+
+    for word in words:
+        if word in negation_words:
+            negate = True
+            new_words.append(word)
+            continue
+
+        if negate:
+            new_words.append("NOT_" + word)
+            negate = False
+        else:
+            new_words.append(word)
+
+    return " ".join(new_words)
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -54,21 +82,18 @@ def prepare_text_and_labels(df: pd.DataFrame):
     if text_col is None:
         raise ValueError("No review text column found.")
 
-    label_col = None
     if "feedback" in columns:
-        label_col = columns["feedback"]
-        y = pd.to_numeric(df[label_col], errors="coerce")
+        y = pd.to_numeric(df[columns["feedback"]], errors="coerce")
     elif "rating" in columns:
-        rating_col = columns["rating"]
         ratings = (
-            df[rating_col]
+            df[columns["rating"]]
             .astype(str)
             .str.extract(r"(\d+(\.\d+)?)")[0]
             .astype(float)
         )
         y = ratings.apply(lambda r: 1 if r >= 4 else (0 if r <= 2 else None))
     else:
-        raise ValueError("No label column found. Need 'feedback' or 'rating'.")
+        raise ValueError("No label column found.")
 
     data = pd.DataFrame({"text": df[text_col], "label": y})
     data = data.dropna(subset=["text", "label"]).copy()
@@ -76,12 +101,12 @@ def prepare_text_and_labels(df: pd.DataFrame):
     data["cleaned"] = data["text"].apply(clean_text)
     data = data[data["cleaned"].str.len() > 2].copy()
 
-    if data["label"].nunique() < 2:
-        raise ValueError("Need at least two classes for training.")
-
     return data
 
 
+# =========================
+# TRAIN MODEL
+# =========================
 @st.cache_resource
 def train_model(dataset_path=None):
     dataset_path = Path(dataset_path) if dataset_path else pick_dataset_path()
@@ -96,27 +121,28 @@ def train_model(dataset_path=None):
         stratify=data["label"],
     )
 
+    # 🔥 IMPROVED TF-IDF
     vectorizer = TfidfVectorizer(
-        max_features=20000,
-        ngram_range=(1, 2),
+        max_features=30000,
+        ngram_range=(1, 3),
         min_df=2,
+        max_df=0.9,
         sublinear_tf=True,
     )
 
     X_train = vectorizer.fit_transform(X_train_text)
     X_test = vectorizer.transform(X_test_text)
 
+    # 🔥 SVM MODEL
     grid = GridSearchCV(
-        estimator=LogisticRegression(max_iter=3000, class_weight="balanced"),
+        estimator=LinearSVC(),
         param_grid={
-            "C": [0.5, 1.0, 2.0, 4.0],
-            "solver": ["liblinear", "saga"],
+            "C": [0.1, 1, 2, 4, 8]
         },
         scoring="f1_macro",
         cv=5,
-        n_jobs=1,
-        verbose=0,
     )
+
     grid.fit(X_train, y_train)
     model = grid.best_estimator_
 
@@ -124,6 +150,7 @@ def train_model(dataset_path=None):
     acc = accuracy_score(y_test, y_pred)
     report = classification_report(y_test, y_pred)
 
+    # save
     with open(MODEL_PATH, "wb") as f:
         pickle.dump(model, f)
     with open(VECTORIZER_PATH, "wb") as f:
@@ -136,8 +163,8 @@ def train_model(dataset_path=None):
         "accuracy": float(acc),
         "classification_report": report,
     }
-    return model, vectorizer, metrics
 
+    return model, vectorizer, metrics
 
 
 def load_model():
@@ -147,7 +174,7 @@ def load_model():
         with open(VECTORIZER_PATH, "rb") as f:
             vectorizer = pickle.load(f)
         return model, vectorizer, None
-    except Exception:
+    except:
         return train_model()
 
 
@@ -159,6 +186,9 @@ def infer_text_column(df: pd.DataFrame):
     return None
 
 
+# =========================
+# TRAIN MODE
+# =========================
 if os.getenv("TRAIN_ONLY") == "1":
     _, _, metrics = train_model()
     print("Model trained successfully")
@@ -166,59 +196,63 @@ if os.getenv("TRAIN_ONLY") == "1":
     print(f"Rows used: {metrics['rows_used']}")
     print(f"Best params: {metrics['best_params']}")
     print(f"Accuracy: {metrics['accuracy']:.4f}")
+
+# =========================
+# APP MODE
+# =========================
 else:
     st.set_page_config(page_title="Sentiment Analyzer", layout="centered")
 
     st.title("Amazon Review Sentiment Analysis")
-    st.write("Predict whether a review is Positive or Negative")
 
     model, vectorizer, metrics = load_model()
 
     if metrics:
-        st.success(f"Model trained successfully. Accuracy: {metrics['accuracy']:.4f}")
-        st.caption(
-            f"Dataset: {metrics['dataset']} | Rows used: {metrics['rows_used']} | "
-            f"Best params: {metrics['best_params']}"
-        )
-        st.text("Classification Report:")
-        st.text(metrics["classification_report"])
+        st.success(f"Accuracy: {metrics['accuracy']:.4f}")
 
+    # SINGLE
     user_input = st.text_area("Enter a review")
 
     if st.button("Predict Sentiment"):
-        if user_input.strip() == "":
-            st.warning("Please enter some text")
-        else:
+        if user_input.strip():
             cleaned = clean_text(user_input)
             vector = vectorizer.transform([cleaned])
-            prediction = model.predict(vector)[0]
-            if prediction == 1:
-                st.success("Positive Review")
+            pred = model.predict(vector)[0]
+
+            if pred == 1:
+                st.success("Positive")
             else:
-                st.error("Negative Review")
+                st.error("Negative")
 
+    # BULK
     st.write("---")
-    st.subheader("Bulk Prediction")
-
-    file = st.file_uploader("Upload CSV or TSV file", type=["csv", "tsv"])
+    file = st.file_uploader("Upload CSV/TSV", type=["csv", "tsv"])
 
     if file:
-        if file.name.lower().endswith(".tsv"):
-            data = pd.read_csv(file, sep="\t")
-        else:
-            data = pd.read_csv(file)
+        data = pd.read_csv(file, sep="\t") if file.name.endswith(".tsv") else pd.read_csv(file)
 
-        text_col = infer_text_column(data)
-        if text_col:
-            data["cleaned"] = data[text_col].apply(clean_text)
-            vectors = vectorizer.transform(data["cleaned"])
-            preds = model.predict(vectors)
+        col = infer_text_column(data)
+
+        if col:
+            data["cleaned"] = data[col].apply(clean_text)
+            preds = model.predict(vectorizer.transform(data["cleaned"]))
+
             data["Predicted Sentiment"] = pd.Series(preds).map({1: "Positive", 0: "Negative"})
+
             st.write(data.head())
-            st.download_button(
-                "Download Results",
-                data.to_csv(index=False),
-                file_name="predictions.csv",
-            )
+
+            # 📊 VISUALIZATION
+            counts = data["Predicted Sentiment"].value_counts()
+
+            fig1, ax1 = plt.subplots()
+            ax1.pie(counts, labels=counts.index, autopct='%1.1f%%')
+            st.pyplot(fig1)
+
+            fig2, ax2 = plt.subplots()
+            counts.plot(kind='bar', ax=ax2)
+            st.pyplot(fig2)
+
+            st.download_button("Download", data.to_csv(index=False), "predictions.csv")
+
         else:
-            st.error("No review text column found in uploaded file.")
+            st.error("No valid text column found.")
